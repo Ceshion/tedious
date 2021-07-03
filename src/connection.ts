@@ -40,11 +40,12 @@ import { Metadata } from './metadata-parser';
 import { FedAuthInfoToken, FeatureExtAckToken } from './token/token';
 import { createNTLMRequest } from './ntlm';
 import { ColumnMetadata } from './token/colmetadata-token-parser';
-
+import { ColumnEncryptionAzureKeyVaultProvider } from './always-encrypted/keystore-provider-azure-key-vault';
 import depd from 'depd';
 import { MemoryCache } from 'adal-node';
 
 import AbortController from 'node-abort-controller';
+import { Parameter, TYPES } from './data-type';
 import { BulkLoadPayload } from './bulk-load-payload';
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -332,6 +333,8 @@ export interface InternalConnectionOptions {
   appName: undefined | string;
   camelCaseColumns: boolean;
   cancelTimeout: number;
+  columnEncryptionKeyCacheTTL: number;
+  columnEncryptionSetting: boolean;
   columnNameReplacer: undefined | ((colName: string, index: number, metadata: Metadata) => string);
   connectionRetryInterval: number;
   connectTimeout: number;
@@ -357,6 +360,7 @@ export interface InternalConnectionOptions {
   enableNumericRoundabort: null | boolean;
   enableQuotedIdentifier: null | boolean;
   encrypt: boolean;
+  encryptionKeyStoreProviders?: KeyStoreProviderMap;
   fallbackToDefaultDb: boolean;
   instanceName: undefined | string;
   isolationLevel: typeof ISOLATION_LEVEL[keyof typeof ISOLATION_LEVEL];
@@ -370,14 +374,21 @@ export interface InternalConnectionOptions {
   requestTimeout: number;
   rowCollectionOnDone: boolean;
   rowCollectionOnRequestCompletion: boolean;
+  serverName: undefined | string;
+  serverSupportsColumnEncryption: boolean;
   tdsVersion: string;
   textsize: string;
+  trustedServerNameAE?: string;
   trustServerCertificate: boolean;
   useColumnNames: boolean;
   useUTC: boolean;
   validateBulkLoadParameters: boolean;
   workstationId: undefined | string;
   lowerCaseGuids: boolean;
+}
+
+interface KeyStoreProviderMap {
+  [key: string]: ColumnEncryptionAzureKeyVaultProvider;
 }
 
 /**
@@ -814,7 +825,7 @@ interface ConnectionOptions {
   /**
    * A boolean determining whether BulkLoad parameters should be validated.
    *
-   * (default: `false`).
+   * (default: `true`).
    */
   validateBulkLoadParameters?: boolean;
 
@@ -843,6 +854,11 @@ const CLEANUP_TYPE = {
   REDIRECT: 1,
   RETRY: 2
 };
+
+interface RoutingData {
+  server: string;
+  port: number;
+}
 
 /**
  * A [[Connection]] instance represents a single connection to a database server.
@@ -953,7 +969,8 @@ class Connection extends EventEmitter {
   /**
    * @private
    */
-  routingData: any;
+  routingData: undefined | RoutingData;
+
   /**
    * @private
    */
@@ -1004,6 +1021,11 @@ class Connection extends EventEmitter {
    * @private
    */
   retryTimer: undefined | NodeJS.Timeout;
+
+  /**
+   * @private
+   */
+  _cancelAfterRequestSent: () => void;
 
   /**
    * Note: be aware of the different options field:
@@ -1203,6 +1225,8 @@ class Connection extends EventEmitter {
         appName: undefined,
         camelCaseColumns: false,
         cancelTimeout: DEFAULT_CANCEL_TIMEOUT,
+        columnEncryptionKeyCacheTTL: 2 * 60 * 60 * 1000,  // Units: miliseconds
+        columnEncryptionSetting: false,
         columnNameReplacer: undefined,
         connectionRetryInterval: DEFAULT_CONNECT_RETRY_INTERVAL,
         connectTimeout: DEFAULT_CONNECT_TIMEOUT,
@@ -1229,6 +1253,7 @@ class Connection extends EventEmitter {
         enableQuotedIdentifier: true,
         encrypt: true,
         fallbackToDefaultDb: false,
+        encryptionKeyStoreProviders: undefined,
         instanceName: undefined,
         isolationLevel: ISOLATION_LEVEL.READ_COMMITTED,
         language: DEFAULT_LANGUAGE,
@@ -1241,9 +1266,12 @@ class Connection extends EventEmitter {
         requestTimeout: DEFAULT_CLIENT_REQUEST_TIMEOUT,
         rowCollectionOnDone: false,
         rowCollectionOnRequestCompletion: false,
+        serverName: undefined,
+        serverSupportsColumnEncryption: false,
         tdsVersion: DEFAULT_TDS_VERSION,
         textsize: DEFAULT_TEXTSIZE,
-        trustServerCertificate: false,
+        trustedServerNameAE: undefined,
+        trustServerCertificate: true,
         useColumnNames: false,
         useUTC: true,
         validateBulkLoadParameters: true,
@@ -1646,6 +1674,10 @@ class Connection extends EventEmitter {
           throw new TypeError('The "config.options.validateBulkLoadParameters" property must be of type boolean.');
         }
 
+        if (config.options.validateBulkLoadParameters === false) {
+          deprecate('Setting the "config.options.validateBulkLoadParameters" to `false` is deprecated and will no longer work in the next major version of `tedious`. Set the value to `true` and update your use of BulkLoad functionality to silence this message.');
+        }
+
         this.config.options.validateBulkLoadParameters = config.options.validateBulkLoadParameters;
       }
 
@@ -1701,6 +1733,13 @@ class Connection extends EventEmitter {
     this.transientErrorLookup = new TransientErrorLookup();
 
     this.state = this.STATE.INITIALIZED;
+
+    this._cancelAfterRequestSent = () => {
+      this.messageIo.sendMessage(TYPE.ATTENTION);
+
+      this.transitionTo(this.STATE.SENT_ATTENTION);
+      this.createCancelTimer();
+    };
   }
 
   connect(connectListener?: (err?: Error) => void) {
@@ -1936,8 +1975,8 @@ class Connection extends EventEmitter {
   /**
    * @private
    */
-  createTokenStreamParser() {
-    const tokenStreamParser = new TokenStreamParser(this.debug, this.config.options);
+  createTokenStreamParser(message: Message) {
+    const tokenStreamParser = new TokenStreamParser(message, this.debug, this.config.options);
 
     tokenStreamParser.on('infoMessage', (token) => {
       this.emit('infoMessage', token);
@@ -2021,7 +2060,12 @@ class Connection extends EventEmitter {
     });
 
     tokenStreamParser.on('routingChange', (token) => {
-      this.routingData = token.newValue;
+      // Removes instance name attached to the redirect url. E.g., redirect.db.net\instance1 --> redirect.db.net
+      const [ server ] = token.newValue.server.split('\\');
+
+      this.routingData = {
+        server, port: token.newValue.port
+      };
     });
 
     tokenStreamParser.on('packetSizeChange', (token) => {
@@ -2166,14 +2210,7 @@ class Connection extends EventEmitter {
           this.dispatchEvent('attention');
         }
 
-        if (request.canceled) {
-          // If we received a `DONE` token with `DONE_ERROR`, but no previous `ERROR` token,
-          // We assume this is the indication that an in-flight request was canceled.
-          if (token.sqlError && !request.error) {
-            this.clearCancelTimer();
-            request.error = RequestError('Canceled.', 'ECANCEL');
-          }
-        } else {
+        if (!request.canceled) {
           if (token.sqlError && !request.error) {
             // check if the DONE_ERROR flags was set, but an ERROR token was not sent.
             request.error = RequestError('An unknown error has occurred.', 'UNKNOWN');
@@ -2457,7 +2494,8 @@ class Connection extends EventEmitter {
   socketClose() {
     this.debug.log('connection to ' + this.config.server + ':' + this.config.options.port + ' closed');
     if (this.state === this.STATE.REROUTING) {
-      this.debug.log('Rerouting to ' + this.routingData.server + ':' + this.routingData.port);
+      this.debug.log('Rerouting to ' + this.routingData!.server + ':' + this.routingData!.port);
+
       this.dispatchEvent('reconnect');
     } else if (this.state === this.STATE.TRANSIENT_FAILURE_RETRY) {
       const server = this.routingData ? this.routingData.server : this.config.server;
@@ -2726,7 +2764,7 @@ class Connection extends EventEmitter {
    */
   execSql(request: Request) {
     try {
-      request.transformIntoExecuteSqlRpc();
+      request.validateParameters();
     } catch (error) {
       request.error = error;
 
@@ -2738,7 +2776,33 @@ class Connection extends EventEmitter {
       return;
     }
 
-    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload(request, this.currentTransactionDescriptor(), this.config.options));
+    const parameters: Parameter[] = [];
+
+    parameters.push({
+      type: TYPES.NVarChar,
+      name: 'statement',
+      value: request.sqlTextOrProcedure,
+      output: false,
+      length: undefined,
+      precision: undefined,
+      scale: undefined
+    });
+
+    if (request.parameters.length) {
+      parameters.push({
+        type: TYPES.NVarChar,
+        name: 'params',
+        value: request.makeParamsParameter(request.parameters),
+        output: false,
+        length: undefined,
+        precision: undefined,
+        scale: undefined
+      });
+
+      parameters.push(...request.parameters);
+    }
+
+    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload('sp_executesql', parameters, this.currentTransactionDescriptor(), this.config.options));
   }
 
   /**
@@ -2898,8 +2962,49 @@ class Connection extends EventEmitter {
    *   Parameters only require a name and type. Parameter values are ignored.
    */
   prepare(request: Request) {
-    request.transformIntoPrepareRpc();
-    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload(request, this.currentTransactionDescriptor(), this.config.options));
+    const parameters: Parameter[] = [];
+
+    parameters.push({
+      type: TYPES.Int,
+      name: 'handle',
+      value: undefined,
+      output: true,
+      length: undefined,
+      precision: undefined,
+      scale: undefined
+    });
+
+    parameters.push({
+      type: TYPES.NVarChar,
+      name: 'params',
+      value: request.parameters.length ? request.makeParamsParameter(request.parameters) : null,
+      output: false,
+      length: undefined,
+      precision: undefined,
+      scale: undefined
+    });
+
+    parameters.push({
+      type: TYPES.NVarChar,
+      name: 'stmt',
+      value: request.sqlTextOrProcedure,
+      output: false,
+      length: undefined,
+      precision: undefined,
+      scale: undefined
+    });
+
+    request.preparing = true;
+    // TODO: We need to clean up this event handler, otherwise this leaks memory
+    request.on('returnValue', (name: string, value: any) => {
+      if (name === 'handle') {
+        request.handle = value;
+      } else {
+        request.error = RequestError(`Tedious > Unexpected output parameter ${name} from sp_prepare`);
+      }
+    });
+
+    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload('sp_prepare', parameters, this.currentTransactionDescriptor(), this.config.options));
   }
 
   /**
@@ -2910,8 +3015,20 @@ class Connection extends EventEmitter {
    *   Parameter values are ignored.
    */
   unprepare(request: Request) {
-    request.transformIntoUnprepareRpc();
-    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload(request, this.currentTransactionDescriptor(), this.config.options));
+    const parameters: Parameter[] = [];
+
+    parameters.push({
+      type: TYPES.Int,
+      name: 'handle',
+      // TODO: Abort if `request.handle` is not set
+      value: request.handle,
+      output: true,
+      length: undefined,
+      precision: undefined,
+      scale: undefined
+    });
+
+    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload('sp_unprepare', parameters, this.currentTransactionDescriptor(), this.config.options));
   }
 
   /**
@@ -2924,8 +3041,28 @@ class Connection extends EventEmitter {
    *   request is executed.
    */
   execute(request: Request, parameters: { [key: string]: unknown }) {
+    const executeParameters: Parameter[] = [];
+
+    executeParameters.push({
+      type: TYPES.Int,
+      name: 'handle',
+      // TODO: Abort if `request.handle` is not set
+      value: request.handle,
+      output: true,
+      length: undefined,
+      precision: undefined,
+      scale: undefined
+    });
+
     try {
-      request.transformIntoExecuteRpc(parameters);
+      for (let i = 0, len = request.parameters.length; i < len; i++) {
+        const parameter = request.parameters[i];
+
+        executeParameters.push({
+          ...parameter,
+          value: parameter.type.validate(parameters[parameter.name])
+        });
+      }
     } catch (error) {
       request.error = error;
 
@@ -2937,7 +3074,7 @@ class Connection extends EventEmitter {
       return;
     }
 
-    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload(request, this.currentTransactionDescriptor(), this.config.options));
+    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload('sp_execute', executeParameters, this.currentTransactionDescriptor(), this.config.options));
   }
 
   /**
@@ -2946,18 +3083,20 @@ class Connection extends EventEmitter {
    * @param request A [[Request]] object representing the request.
    */
   callProcedure(request: Request) {
-    request.validateParameters();
+    try {
+      request.validateParameters();
+    } catch (error) {
+      request.error = error;
 
-    const error = request.error;
-    if (error != null) {
       process.nextTick(() => {
         this.debug.log(error.message);
         request.callback(error);
       });
+
       return;
     }
 
-    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload(request, this.currentTransactionDescriptor(), this.config.options));
+    this.makeRequest(request, TYPE.RPC_REQUEST, new RpcRequestPayload(request.sqlTextOrProcedure!, request.parameters, this.currentTransactionDescriptor(), this.config.options));
   }
 
   /**
@@ -3178,9 +3317,6 @@ class Connection extends EventEmitter {
         message.ignore = true;
         message.end();
 
-        this.clearRequestTimer();
-        this.createCancelTimer();
-
         if (request instanceof Request && request.paused) {
           // resume the request if it was paused so we can read the remaining tokens
           request.resume();
@@ -3197,6 +3333,7 @@ class Connection extends EventEmitter {
 
       message.once('finish', () => {
         request.removeListener('cancel', onCancel);
+        request.once('cancel', this._cancelAfterRequestSent);
 
         this.resetConnectionOnNextRequest = false;
         this.debug.payload(function() {
@@ -3453,26 +3590,7 @@ Connection.prototype.STATE = {
         }
       },
       message: function(message) {
-        const tokenStreamParser = this.createTokenStreamParser();
-
-        message.on('data', (data) => {
-          const ret = tokenStreamParser.write(data);
-          if (ret === false) {
-            // Bridge backpressure from the token stream parser transform to the
-            // packet stream transform.
-            this.messageIo.pause();
-
-            tokenStreamParser.once('drain', () => {
-              // Bridge the release of backpressure from the token stream parser
-              // transform to the packet stream transform.
-              this.messageIo.resume();
-            });
-          }
-        });
-
-        message.once('end', () => {
-          tokenStreamParser.end();
-        });
+        const tokenStreamParser = this.createTokenStreamParser(message);
 
         tokenStreamParser.once('end', () => {
           if (this.loggedIn) {
@@ -3507,26 +3625,7 @@ Connection.prototype.STATE = {
         this.transitionTo(this.STATE.FINAL);
       },
       message: function(message) {
-        const tokenStreamParser = this.createTokenStreamParser();
-
-        message.on('data', (data) => {
-          const ret = tokenStreamParser.write(data);
-          if (ret === false) {
-            // Bridge backpressure from the token stream parser transform to the
-            // packet stream transform.
-            this.messageIo.pause();
-
-            tokenStreamParser.once('drain', () => {
-              // Bridge the release of backpressure from the token stream parser
-              // transform to the packet stream transform.
-              this.messageIo.resume();
-            });
-          }
-        });
-
-        message.once('end', () => {
-          tokenStreamParser.end();
-        });
+        const tokenStreamParser = this.createTokenStreamParser(message);
 
         tokenStreamParser.once('end', () => {
           if (this.ntlmpacket) {
@@ -3580,26 +3679,7 @@ Connection.prototype.STATE = {
         this.fedAuthInfoToken = token;
       },
       message: function(message) {
-        const tokenStreamParser = this.createTokenStreamParser();
-
-        message.on('data', (data) => {
-          const ret = tokenStreamParser.write(data);
-          if (ret === false) {
-            // Bridge backpressure from the token stream parser transform to the
-            // packet stream transform.
-            this.messageIo.pause();
-
-            tokenStreamParser.once('drain', () => {
-              // Bridge the release of backpressure from the token stream parser
-              // transform to the packet stream transform.
-              this.messageIo.resume();
-            });
-          }
-        });
-
-        message.once('end', () => {
-          tokenStreamParser.end();
-        });
+        const tokenStreamParser = this.createTokenStreamParser(message);
 
         tokenStreamParser.once('end', () => {
           if (this.loggedIn) {
@@ -3706,26 +3786,7 @@ Connection.prototype.STATE = {
         this.transitionTo(this.STATE.FINAL);
       },
       message: function(message) {
-        const tokenStreamParser = this.createTokenStreamParser();
-
-        message.on('data', (data) => {
-          const ret = tokenStreamParser.write(data);
-          if (ret === false) {
-            // Bridge backpressure from the token stream parser transform to the
-            // packet stream transform.
-            this.messageIo.pause();
-
-            tokenStreamParser.once('drain', () => {
-              // Bridge the release of backpressure from the token stream parser
-              // transform to the packet stream transform.
-              this.messageIo.resume();
-            });
-          }
-        });
-
-        message.once('end', () => {
-          tokenStreamParser.end();
-        });
+        const tokenStreamParser = this.createTokenStreamParser(message);
 
         tokenStreamParser.once('end', () => {
           this.transitionTo(this.STATE.LOGGED_IN);
@@ -3759,95 +3820,50 @@ Connection.prototype.STATE = {
         // request timer is stopped on first data package
         this.clearRequestTimer();
 
-        const tokenStreamParser = this.createTokenStreamParser();
+        const tokenStreamParser = this.createTokenStreamParser(message);
 
-        message.on('data', (data) => {
-          const ret = tokenStreamParser.write(data);
-          if (ret === false) {
-            // Bridge backpressure from the token stream parser transform to the
-            // packet stream transform.
-            this.messageIo.pause();
+        const onResume = () => { tokenStreamParser.resume(); };
+        const onPause = () => {
+          tokenStreamParser.pause();
 
-            tokenStreamParser.once('drain', () => {
-              // Bridge the release of backpressure from the token stream parser
-              // transform to the packet stream transform.
-              this.messageIo.resume();
-            });
-          }
-        });
+          this.request?.once('resume', onResume);
+        };
 
-        message.once('end', () => {
-          tokenStreamParser.end();
-        });
+        this.request?.on('pause', onPause);
 
-        // If the request was canceled after the request was sent, but before
-        // we started receiving a message, we send an attention message, fully
-        // consume the current message, and then switch the next state.
-        if (this.request?.canceled) {
-          this.messageIo.sendMessage(TYPE.ATTENTION);
-          // Don't wait for the `tokenStreamParser` to end before switching
-          // to the `SENT_ATTENTION` state. The `end` event is delayed and
-          // we would switch to the new state after the attention acknowledgement
-          // message was received.
-          this.transitionTo(this.STATE.SENT_ATTENTION);
-          this.createCancelTimer();
+        if (this.request instanceof Request && this.request.paused) {
+          onPause();
+        }
+
+        const onCancel = () => {
+          tokenStreamParser.removeListener('end', onEndOfMessage);
 
           if (this.request instanceof Request && this.request.paused) {
             // resume the request if it was paused so we can read the remaining tokens
-            this.request?.resume();
+            this.request.resume();
           }
 
-        } else {
-          const onResume = () => { tokenStreamParser.resume(); };
-          const onPause = () => {
-            tokenStreamParser.pause();
+          this.request?.removeListener('pause', onPause);
+          this.request?.removeListener('resume', onResume);
+        };
 
-            this.request?.once('resume', onResume);
-          };
+        const onEndOfMessage = () => {
+          this.request?.removeListener('cancel', this._cancelAfterRequestSent);
+          this.request?.removeListener('cancel', onCancel);
+          this.request?.removeListener('pause', onPause);
+          this.request?.removeListener('resume', onResume);
 
-          this.request?.on('pause', onPause);
-
-          if (this.request instanceof Request && this.request.paused) {
-            onPause();
+          this.transitionTo(this.STATE.LOGGED_IN);
+          const sqlRequest = this.request as Request;
+          this.request = undefined;
+          if (this.config.options.tdsVersion < '7_2' && sqlRequest.error && this.isSqlBatch) {
+            this.inTransaction = false;
           }
+          sqlRequest.callback(sqlRequest.error, sqlRequest.rowCount, sqlRequest.rows);
+        };
 
-          const onCancel = () => {
-            tokenStreamParser.removeListener('end', onEndOfMessage);
-
-            this.messageIo.sendMessage(TYPE.ATTENTION);
-            // Don't wait for the `tokenStreamParser` to end before switching
-            // to the `SENT_ATTENTION` state. The `end` event is delayed and
-            // we would switch to the new state after the attention acknowledgement
-            // message was received.
-            this.transitionTo(this.STATE.SENT_ATTENTION);
-            this.createCancelTimer();
-
-            if (this.request instanceof Request && this.request.paused) {
-              // resume the request if it was paused so we can read the remaining tokens
-              this.request?.resume();
-            }
-
-            this.request?.removeListener('pause', onPause);
-            this.request?.removeListener('resume', onResume);
-          };
-
-          const onEndOfMessage = () => {
-            this.request?.removeListener('cancel', onCancel);
-            this.request?.removeListener('pause', onPause);
-            this.request?.removeListener('resume', onResume);
-
-            this.transitionTo(this.STATE.LOGGED_IN);
-            const sqlRequest = this.request as Request;
-            this.request = undefined;
-            if (this.config.options.tdsVersion < '7_2' && sqlRequest.error && this.isSqlBatch) {
-              this.inTransaction = false;
-            }
-            sqlRequest.callback(sqlRequest.error, sqlRequest.rowCount, sqlRequest.rows);
-          };
-
-          tokenStreamParser.once('end', onEndOfMessage);
-          this.request?.once('cancel', onCancel);
-        }
+        tokenStreamParser.once('end', onEndOfMessage);
+        this.request?.once('cancel', onCancel);
       }
     }
   },
@@ -3869,31 +3885,14 @@ Connection.prototype.STATE = {
         this.attentionReceived = true;
       },
       message: function(message) {
-        const tokenStreamParser = this.createTokenStreamParser();
-
-        message.on('data', (data) => {
-          const ret = tokenStreamParser.write(data);
-          if (ret === false) {
-            // Bridge backpressure from the token stream parser transform to the
-            // packet stream transform.
-            this.messageIo.pause();
-
-            tokenStreamParser.once('drain', () => {
-              // Bridge the release of backpressure from the token stream parser
-              // transform to the packet stream transform.
-              this.messageIo.resume();
-            });
-          }
-        });
-
-        message.once('end', () => {
-          tokenStreamParser.end();
-        });
+        const tokenStreamParser = this.createTokenStreamParser(message);
 
         tokenStreamParser.once('end', () => {
           // 3.2.5.7 Sent Attention State
           // Discard any data contained in the response, until we receive the attention response
           if (this.attentionReceived) {
+            this.attentionReceived = false;
+
             this.clearCancelTimer();
 
             const sqlRequest = this.request!;
