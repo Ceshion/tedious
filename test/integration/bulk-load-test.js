@@ -1,9 +1,13 @@
+// @ts-check
+
 const fs = require('fs');
-const { pipeline, Readable } = require('readable-stream');
-const Connection = require('../../src/connection');
-const Request = require('../../src/request');
-const TYPES = require('../../src/data-type').typeByName;
+const { pipeline, Readable } = require('stream');
 const assert = require('chai').assert;
+
+const TYPES = require('../../src/data-type').typeByName;
+
+import Connection from '../../src/connection';
+import Request from '../../src/request';
 
 const debugMode = false;
 
@@ -349,19 +353,19 @@ describe('BulkLoad', function() {
 
     it('throws an error if the value is invalid', function() {
       assert.throws(() => {
-        connection.newBulkLoad('#tmpTestTable', { order: 'foo' }, () => {});
+        connection.newBulkLoad('#tmpTestTable', /** @type {any} */({ order: 'foo' }), () => {});
       }, 'The "options.order" property must be of type object.');
 
       assert.throws(() => {
-        connection.newBulkLoad('#tmpTestTable', { order: null }, () => {});
+        connection.newBulkLoad('#tmpTestTable', /** @type {any} */({ order: null }), () => {});
       }, 'The "options.order" property must be of type object.');
 
       assert.throws(() => {
-        connection.newBulkLoad('#tmpTestTable', { order: 123 }, () => {});
+        connection.newBulkLoad('#tmpTestTable', /** @type {any} */({ order: 123 }), () => {});
       }, 'The "options.order" property must be of type object.');
 
       assert.throws(() => {
-        connection.newBulkLoad('#tmpTestTable', { order: { foo: 'bar' } }, () => {});
+        connection.newBulkLoad('#tmpTestTable', /** @type {any} */({ order: { foo: 'bar' } }), () => {});
       }, 'The value of the "foo" key in the "options.order" object must be either "ASC" or "DESC".');
     });
 
@@ -671,7 +675,7 @@ describe('BulkLoad', function() {
         }
       })(), { objectMode: true });
 
-      rowSource.pipe(rowStream);
+      rowSource.pipe(/** @type {NodeJS.WritableStream} */(/** @type {any} */(rowStream)));
     }
 
     function completeBulkLoad(err, rowCount) {
@@ -766,7 +770,7 @@ describe('BulkLoad', function() {
         [ 4, 'Charmander' ],
         { id: 5, name: 'Charmeleon' },
         [ 6, 'Charizard' ]
-      ]).pipe(bulkLoad.getRowStream());
+      ]).pipe(/** @type {NodeJS.WritableStream} */(/** @type {any} */(bulkLoad.getRowStream())));
 
       connection.execBulkLoad(bulkLoad);
     });
@@ -797,7 +801,7 @@ describe('BulkLoad', function() {
       const bulkLoad = connection.newBulkLoad('#stream_test', completeBulkLoad);
       bulkLoad.addColumn('i', TYPES.Int, { nullable: false });
 
-      const rowStream = bulkLoad.getRowStream();
+      const rowStream = /** @type {NodeJS.WritableStream} */(/** @type {any} */(bulkLoad.getRowStream()));
       connection.execBulkLoad(bulkLoad);
 
       let rowCount = 0;
@@ -872,7 +876,7 @@ describe('BulkLoad', function() {
 
       bulkLoad.addColumn('i', TYPES.Int, { nullable: false });
 
-      const rowStream = bulkLoad.getRowStream();
+      const rowStream = /** @type {NodeJS.WritableStream} */(/** @type {any} */(bulkLoad.getRowStream()));
       connection.execBulkLoad(bulkLoad);
 
       let rowCount = 0;
@@ -989,7 +993,7 @@ describe('BulkLoad', function() {
 
       bulkLoad.addColumn('i', TYPES.Int, { nullable: false });
 
-      const rowStream = bulkLoad.getRowStream();
+      const rowStream = /** @type {NodeJS.WritableStream} */(/** @type {any} */(bulkLoad.getRowStream()));
 
       connection.execBulkLoad(bulkLoad);
 
