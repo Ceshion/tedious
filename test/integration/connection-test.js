@@ -1,10 +1,14 @@
+// @ts-check
+
 const async = require('async');
-const Connection = require('../../src/connection');
-const Request = require('../../src/request');
 const fs = require('fs');
 const homedir = require('os').homedir();
 const assert = require('chai').assert;
 const os = require('os');
+
+import Connection from '../../src/connection';
+import { ConnectionError, RequestError } from '../../src/errors';
+import Request from '../../src/request';
 
 function getConfig() {
   const config = JSON.parse(
@@ -49,7 +53,7 @@ describe('Initiate Connect Test', function() {
 
     const connection = new Connection(config);
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -86,7 +90,7 @@ describe('Initiate Connect Test', function() {
 
     const connection = new Connection(config);
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -126,7 +130,7 @@ describe('Initiate Connect Test', function() {
       connection.close();
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -161,7 +165,7 @@ describe('Initiate Connect Test', function() {
       connection.close();
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -196,7 +200,7 @@ describe('Initiate Connect Test', function() {
       connection.close();
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -290,8 +294,8 @@ describe('Initiate Connect Test', function() {
 
     const connection = new Connection(config);
     connection.connect(function(err) {
-      assert.ok(err);
-      assert.strictEqual(err.code, 'ESOCKET');
+      assert.instanceOf(err, ConnectionError);
+      assert.strictEqual(/** @type {ConnectionError} */(err).code, 'ESOCKET');
     });
 
     connection.on('end', function() {
@@ -386,7 +390,7 @@ describe('Initiate Connect Test', function() {
       conn.close();
 
       assert.instanceOf(err, Error);
-      assert.strictEqual(err.message, 'Failed to connect to 192.0.2.1:1433 in 3000ms');
+      assert.strictEqual(/** @type {Error} */(err).message, 'Failed to connect to 192.0.2.1:1433 in 3000ms');
 
       done();
     });
@@ -401,6 +405,12 @@ describe('Ntlm Test', function() {
     Upper: 2,
   };
 
+  /**
+   * @this {Mocha.Context}
+   * @param {*} done
+   * @param {number} domainCase
+   * @returns
+   */
   function runNtlmTest(done, domainCase) {
     const ntlmConfig = getNtlmConfig();
 
@@ -429,7 +439,7 @@ describe('Ntlm Test', function() {
       connection.close();
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -468,7 +478,7 @@ describe('Encrypt Test', function() {
       connection.close();
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -493,6 +503,7 @@ describe('Encrypt Test', function() {
 });
 
 describe('BeginTransaction Tests', function() {
+  /** @type {Connection} */
   let connection;
   beforeEach(function(done) {
     const config = getConfig();
@@ -512,7 +523,7 @@ describe('BeginTransaction Tests', function() {
   it('should validate isolation level is a number', function() {
     assert.throws(() => {
       const callback = () => { assert.fail('callback should not be executed'); };
-      connection.beginTransaction(callback, 'test', 'some string');
+      connection.beginTransaction(callback, 'test', /** @type {any} */('some string'));
     }, TypeError, 'The "isolationLevel" argument must be of type number. Received type string (some string)');
   });
 
@@ -564,7 +575,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -603,7 +614,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -647,7 +658,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -702,7 +713,7 @@ describe('Insertion Tests', function() {
       execSql();
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -752,7 +763,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -784,7 +795,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -802,8 +813,8 @@ describe('Insertion Tests', function() {
     const config = getConfig();
 
     const request = new Request('select 8 as C1', function(err, rowCount) {
-      assert.ok(err);
-      assert.strictEqual(err.code, 'ECLOSE');
+      assert.instanceOf(err, RequestError);
+      assert.strictEqual(/** @type {RequestError} */(err).code, 'ECLOSE');
     });
 
     const connection = new Connection(config);
@@ -817,7 +828,7 @@ describe('Insertion Tests', function() {
       connection.close();
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -862,7 +873,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -898,7 +909,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -936,7 +947,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -963,7 +974,7 @@ describe('Insertion Tests', function() {
       connection.close();
     });
 
-    request.on('doneInProc', function(rowCount, more, rows) {
+    request.on('doneInProc', function(rowCount, more, /** @type {any} */rows) {
       assert.strictEqual(rows.length, 1);
 
       switch (++doneCount) {
@@ -984,7 +995,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -1026,7 +1037,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -1042,14 +1053,24 @@ describe('Insertion Tests', function() {
   it('should reset Connection', function(done) {
     const config = getConfig();
 
+    /**
+     * @param {(err?: Error | null | undefined, result?: any) => void} callback
+     */
     function testAnsiNullsOptionOn(callback) {
       testAnsiNullsOption(true, callback);
     }
 
+    /**
+     * @param {(err?: Error | null | undefined, result?: any) => void} callback
+     */
     function testAnsiNullsOptionOff(callback) {
       testAnsiNullsOption(false, callback);
     }
 
+    /**
+     * @param {boolean} expectedOptionOn
+     * @param {(err?: Error | null | undefined, result?: any) => void} callback
+     */
     function testAnsiNullsOption(expectedOptionOn, callback) {
       const request = new Request('select @@options & 32', function(err, rowCount) {
         callback(err);
@@ -1063,6 +1084,9 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     }
 
+    /**
+     * @param {(err?: Error | null | undefined, result?: any) => void} callback
+     */
     function setAnsiNullsOptionOff(callback) {
       const request = new Request('set ansi_nulls off', function(err, rowCount) {
         callback(err);
@@ -1100,7 +1124,7 @@ describe('Insertion Tests', function() {
       ]);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -1116,11 +1140,12 @@ describe('Insertion Tests', function() {
   it('should support cancelling a request while it is processed on the server', function(done) {
     const config = getConfig();
 
+    /** @type {[number, number]} */
     let cancelledAt;
 
     const request = new Request("select 1 as C1; waitfor delay '00:00:05'; select 2 as C2", (err, rowCount, rows) => {
       assert.instanceOf(err, Error);
-      assert.strictEqual(err.message, 'Canceled.');
+      assert.strictEqual(/** @type {Error} */(err).message, 'Canceled.');
 
       assert.isUndefined(rowCount);
 
@@ -1172,7 +1197,7 @@ describe('Insertion Tests', function() {
       }, 2000);
     });
 
-    connection.on('end', (info) => {
+    connection.on('end', () => {
       done();
     });
 
@@ -1192,7 +1217,7 @@ describe('Insertion Tests', function() {
     const request = new Request(
       "select 1 as C1;waitfor delay '00:00:05';select 2 as C2",
       function(err, rowCount, rows) {
-        assert.equal(err.message, 'Timeout: Request failed to complete in 1000ms');
+        assert.equal(/** @type {Error} */(err).message, 'Timeout: Request failed to complete in 1000ms');
 
         connection.close();
       }
@@ -1224,7 +1249,7 @@ describe('Insertion Tests', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
 
@@ -1252,7 +1277,7 @@ describe('Advanced Input Test', function() {
       connection.execSqlBatch(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
   }
@@ -1311,7 +1336,7 @@ describe('Date Insert Test', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
   };
@@ -1362,7 +1387,7 @@ describe('Language Insert Test', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
   }
@@ -1403,7 +1428,7 @@ describe('should test date format', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
   }
@@ -1457,7 +1482,7 @@ describe('Boolean Config Options Test', function() {
       connection.execSql(request);
     });
 
-    connection.on('end', function(info) {
+    connection.on('end', function() {
       done();
     });
   }
